@@ -1,0 +1,1951 @@
+---
+title: "Non-Random Resampling: How often do we need to sample wetlands?"
+author: "Kenneth Anderson"
+date: "2024-03-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(ggpubr)
+```
+Load packages: lubridate, tidyr, dplyr, tidyverse, ggpubr
+
+# Table of contents
+1. [Selection of Random Days](#randomdays)
+2. [Sampling on single day each week](#singledays)
+3. [Plots of data](#plots)
+4. [Stress Testing the Algorithm](#stresstests)
+5. [Scaling to Monthly Data](#randomdaysmonthly)
+6. [Comparison of Monthly and Weekly Data](#bigplot)
+7. [Storm Events](#storms)
+7. [Load Leaving the wetland](#loadout)
+8. [Variations on sampling regime](#variations)
+9. [Load out with real discharge](#realdischarge)
+10. [Comparison of methods](#methodcompare)
+
+<a name="randomdays"></a>
+
+### How often do we need to sample wetlands? 
+
+To do this we're going to use Old Woman Creek Estuary as an example. We will be estimating the phosphorus load entering the system. We'll get to retention later, but it's going to be a lot more complicated because there are different frequencies of data at the inflow and outflow of the wetland. <br>
+
+The inflow of the wetland however, has data collected daily for the past 8 years. <br>
+
+Units for this phosphorus data are in ug/L.
+
+```{r}
+setwd("C:/Users/kande120/OneDrive - Kent State University/Phosphorus Budgets/OWC/Data")
+owcmasterdata<-read.csv("Master_Nutrient_Dataset_3-7-24.csv")
+owcmasterdata$Date<-mdy(owcmasterdata$Date) # tell R that the date is a date 
+
+# now lets subset the hell out of this dataset:
+owcRL <- subset(owcmasterdata, Project == "RL") # only the retention and load project 
+owcRLinflow <- subset(owcRL, Site == "BR") # only the inflow at Berlin Road
+owcRLinflowrecent <- subset(owcRLinflow, Date >= "2015-01-01") # only from 2015 on
+owcDF = owcRLinflowrecent %>% group_by(Site, Date = as.Date(Date,"%Y-%m-%d")) %>% summarise(across(c(TP), mean)) # average any daily TP replicates together 
+```
+
+Hydrologic data is collected at a USGS gauge at the inlet to the wetland that measures discharge in cubic feet per second. We will use the USGS dataRetrieval package to load it in.
+```{r}
+library(dataRetrieval)
+# Old Woman Creek at Berlin Rd near Huron OH
+siteNumber <- "04199155"
+owcInfo <- readNWISsite(siteNumber)
+parameterCd <- "00060"
+
+# As a note they have sub-daily data, but we don't need it. We're going to be pairing with daily nutrient data so it's actually super convenient that this code makes the data daily for us!
+# Raw daily data: 
+rawDailyData <- readNWISdv(
+  siteNumber, parameterCd,
+  "2015-05-05", "2024-01-01")
+colnames(rawDailyData)[colnames(rawDailyData) == 'X_00060_00003'] <- 'discharge_cfs'  #rename the discharge column to something meaningful
+
+owcDF <- owcDF %>% 
+  left_join(y=rawDailyData, by=c("Date")) # merge out 2 datasets
+
+owcBR = owcDF[c("Date","TP","discharge_cfs")] # clean up our dataset so it's just our 3 variables we're interested in
+owcBR$discharge_L = owcBR$discharge_cfs * 86400 * 28.3168 # Convert cubic feet/second to liters/day
+owcBR$TPmgL = owcBR$TP / 1000 # convert ug/L to mg/L
+owcBR$P_lbs = owcBR$discharge_L * owcBR$TPmgL / 453600 # calculate P load and convert to lbs 
+
+
+# we're going to gap fill. It'll make everything easier in terms of coding this out
+# first we need to fill in all missing dates with NAs so r doesn't get mad at us:
+owcBRcomplete = owcBR %>% 
+  complete(Date = seq.Date(as.Date("2015-05-04"), max(Date), by = "1 day"))
+
+# Now we need to define the weeks and years in our dataset so r can pick them out
+owcBRcomplete$day <- weekdays(owcBRcomplete$Date) # Take out the day of the week
+owcBRcomplete$week<-isoweek(owcBRcomplete$Date) # Take out the number for each isoweek.
+owcBRcomplete$year<-isoyear(owcBRcomplete$Date) # Create a variable for each isoyear
+
+# then we fill all the gaps with the median value (we're going to use the median for the ENTIRE DATASET)
+owcBR_GF = owcBRcomplete %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+```
+
+As a note: we're using ISO week here so we also need to use iso year in order to make sure that every week is measured separately. The code will get screwy if you don't do this because then you have duplicates because it shoves the wrong samples into the wrong years. Iso calender is a whole separate calendar from our normal one so that's why it gets weird. 
+
+Now we can calculate the annual retention for each year: 
+```{r}
+# Now we can calculate the annual retention for each year:
+trueloading = owcBR_GF %>% 
+  group_by(year = lubridate::year(Date)) %>%
+  summarize(sum_P_true = sum(P_lbs,na.rm = T))
+print(trueloading)
+```
+
+
+Now we can start resampling our data: <br>
+
+An important note here is that we don't want to resample hydrology data, we want to ONLY resample phosphorus data and then APPLY it to the continous (daily) hydrology data. The goal is to understand how nutrient sampling frequency affects estimates of retention.
+
+To start our we'll move from daily sampling to weekly sampling:
+
+```{r}
+
+# first we make a function to translate our dataset from daily to weekly sampling with a random selection of days being chosen! Then calculate the annual retention for each year within the dataset
+weeksample<-function (data){
+  # convert to weekly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(week,year) %>% # group by both week and year so this works across different weeks and across different years
+    mutate(random_day = sample(day,1)) %>% # sample 1 random day out of the week
+    mutate(TP_week = TPmgL[day == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each week
+  working$P_lbs_week = working$discharge_L * working$TP_week / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+weeksample(owcBR_GF) # here's an example of a single iteration of weekly sampling
+
+```
+
+Now we can replicate this function 1000 times in order to get a wide spread of what our estimates will look like as we standardize our data to weekly samples instead of daily. 
+
+```{r}
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdf=replicate(1000, weeksample(owcBR_GF),simplify=FALSE)
+# combine all our dataframes together
+bigdf_combined <- map_dfr(bigdf, bind_rows, .id = "tib")                                  
+bigdf_combined$year = as.factor(bigdf_combined$year)
+trueloading$year = as.factor(trueloading$year)
+bigdf_combined$P_thous = bigdf_combined$sum_P / 1000
+trueloading$P_thous_true = trueloading$sum_P_true / 1000
+
+# lets plot it out: 
+ggplot() +
+  geom_boxplot(data = bigdf_combined, aes(x=year, y=P_thous)) + 
+  geom_point(data = trueloading, aes (x=year, y=P_thous_true),color='red')
+
+```
+<br>
+You can see there is across the board an underestimate of true values when converting from daily to weekly sampling. Likely this is because high concentrations are irregular and spread out, so random days are not likely to catch the big peaks in P concentrations on certain days with high loading. 
+
+<br>
+Let's take out time and calculate some metrics of this model including the bias, the imprecision, and the relative root mean square error!
+
+```{r}
+bigdf_combined = bigdf_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdf_combined$e = (bigdf_combined$P_thous - bigdf_combined$P_thous_true)/ bigdf_combined$P_thous_true # calculate the error associated with each budget
+
+dfe = bigdf_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+print(dfe)
+mean(dfe$med)
+
+df90 = bigdf_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+df10 = bigdf_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisiondf = df90 %>% left_join(y=df10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisiondf$imprecision = Imprecisiondf$value90-Imprecisiondf$value10
+print(Imprecisiondf) # values below 20% are acceptable. This indicates that there's high variation in uncertainty of our estimation.
+mean(Imprecisiondf$imprecision) # the average 
+```
+Now we're going to start a new dataframe to contain the bias and imprecision of each method so we can plot it all out later!
+
+```{r}
+weeklystats <- dfe %>% 
+  left_join(y=Imprecisiondf, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "weekly")
+
+methodstats = weeklystats[,c("year","med","imprecision","method")]
+```
+<a name="singledays"></a>
+
+## How about a more practical variation of this: choosing individual days
+
+We can also look at how sampling on a specific day of the week changes results. This method keeps a standard distance between samples, but gives us less insight into the amount of potential variability with only 7 possible combinations. 
+
+```{r}
+## Alternate method using SPECIFIC days of the week: 
+# create a function to strip out each variation with a certain day of the week being sampled
+weekdayssamp<-function (data){
+  # convert to weekly sampling
+  weekdays <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+  working<-data #create dummy data set to operate on
+  output<-data.frame(year=integer(0), #create empty data frame to put our output variables in
+                     sum_P=integer(0))
+  while (length(weekdays) > 1){ #while there's still more days of the week
+    working <- data %>% 
+      group_by(week,year) %>% # group by both week and year so this works across different weeks and across different years
+      mutate(TP_week = ifelse(is.na(TPmgL[day == weekdays[1]]), yes = mean(TPmgL), no = TPmgL[day == weekdays[1]] )) 
+    working$P_lbs_week = working$discharge_L * working$TP_week / 453600 # calculate P load and convert to lbs 
+    out <- working %>% # take our dataset
+      group_by(year) %>% # group so we get a value for each year
+      summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+    #add a conditional so that if there's missing data, it's not included in output
+    output<-rbind(output, out) #append the stats to the output data frame
+    weekdays<-weekdays[-1] #cut out the first year of the remaining data + repeat
+  }
+  return(output)#output the data frame
+}
+
+weeklysamp = weekdayssamp(owcBR_GF)
+
+```
+
+Now we can plot out our results as compared to the true values calculated from the entire dataset
+
+```{r}
+# let's look at the difference from the true value instead. 
+trueloading$sum_P_true = trueloading$sum_P_true
+trueloading$year = as.factor(trueloading$year)
+weeklysamp$year = as.factor(weeklysamp$year)
+
+
+# plot out the range from all 7 weekdays along with the true value (in red):
+ggplot() +
+  geom_boxplot(data = weeklysamp, aes(x=year, y=sum_P)) + 
+  geom_point(data = trueloading, aes (x=year, y=sum_P_true),color='red')
+```
+
+
+<a name="plots"></a>
+
+## Plotting the data
+Lets take a look at phosphorus concentrations to see if we can explain this: 
+
+```{r}
+ggplot(owcBR_GF, aes(x=Date, y=TP)) +
+  geom_line() + 
+  xlab("") + ylab("TP ug/L")+theme_classic()
+
+ggplot(owcBR_GF, aes(x=Date, y=P_lbs)) +
+  geom_line() + 
+  xlab("") + ylab("TP load (lbs)")+theme_classic()
+
+ggplot(owcBR_GF, aes(x=Date, y=discharge_L)) +
+  geom_line() + 
+  xlab("") + ylab("Discharge (L)")+theme_classic()
+
+mid<-26
+library(ggpubr)
+ggplot(owcBR_GF, aes(x=TP, y=discharge_L, color = week)) +
+  geom_point() + 
+  xlab("TP (mg/L)") + ylab("Discharge (L)")+ 
+  scale_color_gradient2(midpoint=mid, low="mediumspringgreen", mid="slateblue", high="mediumspringgreen")+theme_classic()+
+  stat_cor(method = "pearson",aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")))+ geom_smooth(method=lm, se=FALSE, fullrange=F) 
+```
+
+There is a positive relationship between P and discharge but it's quite a variable relationship.
+
+<a name="stresstests"></a>
+
+## Lets stress test this algorithm
+
+Lets start out by seeing if we're able to modify the algorithm with our real data and only pick out the highest value of phosphorus for each week. This should produce the highest possible result and overestimate phosphorus retention (but based on our previous model, not by that much). 
+
+```{r}
+# make a function that does the same as above but instead of selecting a random phosphorus concentration selects the maximum for the week
+
+maxsample<-function (data){
+  # convert to weekly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(week,year) %>% # group by both week and year so this works across different weeks and across different years
+    mutate(max_day =  ifelse(all(is.na(TPmgL)), yes = NA, no = sample(day[which.max(TPmgL)]))) %>% # sample the day with the highest TP value
+    mutate(TP_week = TPmgL[day == max_day]) %>%  # select the maximum TP value
+    select(-max_day) # delete our maximum day so a new one is chosen for each week
+  working$P_lbs_week = working$discharge_L * working$TP_week / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+maxvalues = maxsample(owcBR_GF) # run the code
+maxvalues$year= as.factor(maxvalues$year)
+
+trueloading1 = trueloading[c("year","sum_P_true")] # clean up our dataset so it's just our 3 variables we're interested in
+trueloading1$year= as.factor(trueloading1$year)
+
+comparison <- trueloading1 %>% 
+  left_join(y=,maxvalues, by=c("year")) # merge out 2 datasets
+
+print(comparison) # compare to the true loading
+
+# plot it out!
+ggplot() +
+  geom_boxplot(data = bigdf_combined, aes(x=year, y=sum_P)) + 
+  geom_point(data = trueloading1, aes (x=year, y=sum_P_true),color='red')+ 
+  geom_point(data = maxvalues, aes (x=year, y=sum_P),color='blue')
+```
+
+<br>
+We see that the maximum value always over predicts, BUT it over predicts MORE than any of our values from our random re-sampling... 
+This is because it's just unlikely to select the max values for every week. I think there's 7^52 (8.812479e+43) possible combinations for each year so it's not unlikely that we wouldn't reach the maximum value. <br>
+
+
+Now we're going to make some fake data to run the actual algorithm on: 
+
+```{r}
+library(truncnorm)
+n <- 1460
+fakedata <- data.frame(
+  Date = seq(as.Date("2015-01-01"), by = "day", length.out = n),
+  discharge_L = rtruncnorm(n=n, a=0, b=852089387, mean=52089387, sd=40000000),
+  TPmgL = rtruncnorm(n=n, a=0, b=5, mean=1, sd=1.5)
+)
+fakedata$P_lbs = fakedata$discharge_L * fakedata$TPmgL / 453600 # calculate P load and convert to lbs 
+
+# Now we need to define the weeks and years in our dataset so r can pick them out
+fakedata$day <- weekdays(fakedata$Date) # Take out the day of the week
+fakedata$week<-isoweek(fakedata$Date) # Take out the number for each week.
+fakedata$year<-isoyear(fakedata$Date) # Create a variable for each year
+
+# Now we can calculate the annual retention for each year:
+fakeloading = fakedata %>% 
+  group_by(year = lubridate::year(Date)) %>%
+  summarize(sum_P = sum(P_lbs,na.rm = T))
+print(fakeloading)
+
+
+# Now we run it and combine all the results into a dataframe
+bigfake=replicate(1000, weeksample(fakedata),simplify=FALSE)
+# combine all our dataframes together
+bigfake_combined <- map_dfr(bigfake, bind_rows, .id = "tib")                                  
+bigfake_combined$year = as.factor(bigfake_combined$year)
+fakeloading$year = as.factor(fakeloading$year)
+bigfake_combined$P_thous = bigfake_combined$sum_P / 1000
+fakeloading$P_thous_true = fakeloading$sum_P / 1000
+# lets plot it out: 
+ggplot() +
+  geom_boxplot(data = bigfake_combined, aes(x=year, y=P_thous)) + 
+  geom_point(data = fakeloading, aes (x=year, y=P_thous_true),color='red')
+
+```
+<br>
+
+IT'S WORKING!! The same algorithm with less spiky data produces a better estimate when switching from daily to weekly data.
+
+
+
+<a name="randomdaysmonthly"></a>
+
+## Lets see how monthly sampling does!
+
+```{r}
+# first need to pick up the individual months:
+owcBR_GF$month<-month(owcBRcomplete$Date) # Create a variable for each month
+owcBR_GF$daynum<-day(owcBRcomplete$Date) # Create a variable for each day of the month
+owcBR_GF$year<-year(owcBRcomplete$Date) # Create a variable for each year (but this time NOT iso year because that makes everything all screwy)
+
+# new function but this time selecting a random day of each MONTH
+monthsample<-function (data){
+  # convert to monthly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for monthly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working$P_lbs_week = working$discharge_L * working$TP_month / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+monthsample(owcBR_GF) # here's an example of a single iteration of monthly sampling
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfm=replicate(1000, monthsample(owcBR_GF),simplify=FALSE)
+# combine all our dataframes together
+bigdfm_combined <- map_dfr(bigdfm, bind_rows, .id = "tib")                                  
+bigdfm_combined$year = as.factor(bigdfm_combined$year)
+trueloading$year = as.factor(trueloading$year)
+bigdfm_combined$P_thous = bigdfm_combined$sum_P / 1000
+trueloading$P_thous_true = trueloading$sum_P_true / 1000
+maxvalues$P_thous = maxvalues$sum_P / 1000
+
+ggplot() +
+  geom_boxplot(data = bigdfm_combined, aes(x=year, y=P_thous), fill = 'goldenrod') + # monthly sampling
+  geom_point(data = trueloading, aes (x=year, y=P_thous_true),color='mediumorchid') # daily sampling 
+```
+<br>
+A notable differences is the higher spread/abundance of outliers in monthly as compared to weekly sampling. <br>
+
+
+<a name="bigplot"></a>
+
+Let's look at the maximums for monthly sampling and then plot everything out:
+```{r}
+
+maxsamplem<-function (data){
+  # convert to weekly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(max_day =  daynum[which.max(TPmgL)]) %>% # sample the day with the highest TP value
+    mutate(TP_month = TPmgL[daynum == max_day]) %>%  # select the maximum TP value
+    select(-max_day) # delete our maximum day so a new one is chosen for each month
+  working$P_lbs_month = working$discharge_L * working$TP_month / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_month,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+maxvaluesm = maxsamplem(owcBR_GF)
+maxvaluesm$P_thous = maxvaluesm$sum_P / 1000
+maxvaluesm$year = as.factor(maxvaluesm$year)
+
+# lets plot everything out together: 
+ggplot() +
+  geom_boxplot(data = bigdf_combined, aes(x=year, y=P_thous), fill = 'darkcyan') + # weekly sampling
+  geom_boxplot(data = bigdfm_combined, aes(x=year, y=P_thous), fill = 'goldenrod') + # monthly sampling
+  geom_point(data = trueloading, aes (x=year, y=P_thous_true),color='mediumorchid')+ # daily sampling
+  geom_point(data = maxvalues, aes (x=year, y=P_thous),color='blue')+ # maximum values for taking the max number each WEEK
+  geom_point(data = maxvaluesm, aes (x=year, y=P_thous),color='red') # maximum values for taking the max number each MONTH
+```
+
+<br>
+We see that monthly sampling has greater underestimates than we get for weekly sampling! BUT there are a lot more outliers than we get at weekly sampling! It's more likely to underestimate AND more likely to overestimate (albeit only as outliers). 
+
+<br>
+Let's take out time and calculate some metrics of this model including the bias, the imprecision, and the relative root mean square error!
+
+```{r}
+bigdfm_combined = bigdfm_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfm_combined$e = (bigdfm_combined$P_thous - bigdfm_combined$P_thous_true)/ bigdfm_combined$P_thous_true # calculate the error associated with each budget
+
+dfme = bigdfm_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+print(dfme)
+mean(dfme$med)
+
+dfm90 = bigdfm_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfm10 = bigdfm_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdf = dfm90 %>% left_join(y=dfm10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdf$imprecision = Imprecisionmdf$value90-Imprecisionmdf$value10
+print(Imprecisionmdf) # values below 20% are acceptable. This indicates that there's high variation in uncertainty of our estimation.
+mean(Imprecisionmdf$imprecision) # the average 
+
+# now to add these to our running dataframe of methodstats: 
+monthlystats <- dfme %>% 
+  left_join(y=Imprecisionmdf, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "monthly")
+monthlystats = monthlystats[,c("year","med","imprecision","method")] # get rid of the excess columns
+
+methodstats = rbind(methodstats,monthlystats) # add on to our running dataframe
+```
+
+<a name="storms"></a>
+
+## Lets try picking out storm events to estimate loading instead!
+
+We're going to go with the OWC storm event standards and consider all days with flow > 25 CFS to be storm events. 
+
+```{r}
+stormflow = 25 * 86400 * 28.3168 # convert 25 CFS to liters / day
+```
+Now we're going to make a function that will sample monthly AND sample all storm events with flow > 25 CFS:
+
+```{r}
+# new function but this time selecting a random day of each MONTH and including ALL storm sampling events
+monthstormsample<-function (data){
+  # convert to monthly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working$TP_month = ifelse(working$discharge_cfs>25, working$TPmgL, working$TP_month)
+  working$P_lbs_week = working$discharge_L * working$TP_month / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+monthstormsample(owcBR_GF)
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstorm=replicate(1000, monthstormsample(owcBR_GF),simplify=FALSE)
+# combine all our dataframes together
+bigdfmstorm_combined <- map_dfr(bigdfmstorm, bind_rows, .id = "tib")                                  
+bigdfmstorm_combined$year = as.factor(bigdfmstorm_combined$year)
+bigdfmstorm_combined$P_thous = bigdfmstorm_combined$sum_P / 1000
+
+
+# lets plot everything out together: 
+ggplot() +
+  geom_boxplot(data = bigdfmstorm_combined, aes(x=year, y=P_thous), fill = 'darkgrey') + # monthly + storm sampling
+  geom_boxplot(data = bigdfm_combined, aes(x=year, y=P_thous), fill = 'goldenrod') + # monthly sampling
+  geom_point(data = trueloading, aes (x=year, y=P_thous_true),color='mediumorchid') # daily sampling
+ 
+```
+<br>
+Capturing all the storm events makes it pretty much right on the money (a little bit of an overestimate some years). 
+<br>
+Now lets see if we can try with varying numbers of storm events!
+
+```{r}
+# First lets look at how many storm events there are each year! 
+
+owcBR_GF %>%
+  group_by(year) %>%
+  summarize(discharge = sum(discharge_cfs > 25)) 
+
+```
+There are a LOT of storm events when we're considering 25 as our cutoff for storm flow
+```{r}
+owcBR_GF %>%
+  group_by(year) %>%
+  summarize(discharge = sum(discharge_cfs > 100)) 
+```
+A more reasonable number when we scale that up to 100 cfs as our cutoff! 
+
+```{r}
+# new function but this time selecting a random day of each MONTH and including ALL storm sampling events
+monthstormsample<-function (data){
+  # convert to monthly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working$TP_month = ifelse(working$discharge_cfs>100, working$TPmgL, working$TP_month)
+  working$P_lbs_week = working$discharge_L * working$TP_month / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+monthstormsample(owcBR_GF)
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstorms=replicate(1000, monthstormsample(owcBR_GF),simplify=FALSE)
+# combine all our dataframes together
+bigdfmstorms_combined <- map_dfr(bigdfmstorms, bind_rows, .id = "tib")                                  
+bigdfmstorms_combined$year = as.factor(bigdfmstorms_combined$year)
+bigdfmstorms_combined$P_thous = bigdfmstorms_combined$sum_P / 1000
+
+
+# lets plot everything out together: 
+ggplot() +
+  geom_boxplot(data = bigdfmstorms_combined, aes(x=year, y=P_thous), fill = 'darkgrey') + # monthly + storm sampling
+  geom_boxplot(data = bigdfm_combined, aes(x=year, y=P_thous), fill = 'goldenrod') + # monthly sampling
+  geom_point(data = trueloading, aes (x=year, y=P_thous_true),color='mediumorchid') # daily sampling
+
+# lets calculate our bias metrics
+bigdfmstorms_combined = bigdfmstorms_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstorms_combined$e = (bigdfmstorms_combined$P_thous - bigdfmstorms_combined$P_thous_true)/ bigdfmstorms_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstorms_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+print(dfmse)
+mean(dfmse$med)
+
+dfms90 = bigdfmstorms_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstorms_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+print(Imprecisionmdfs) # values below 20% are acceptable. This indicates that there's high variation in uncertainty of our estimation.
+mean(Imprecisionmdfs$imprecision) # the average 
+
+# now to add these to our running dataframe of methodstats: 
+allstormstats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "all_storms")
+allstormstats = allstormstats[,c("year","med","imprecision","method")] # get rid of the excess columns
+
+methodstats = rbind(methodstats,allstormstats) # add on to our running dataframe
+```
+
+
+
+AND we see that at 100 cfs as our storm event cutoff we still have a pretty good estimate of loading! (there's a slight underestimate).
+<br>
+
+So NOW our goal is to make a new function to look at how many storms we need to sample to get an accurate loading budget. 
+```{r}
+# new function but this time selecting a random day of each MONTH and including ALL storm sampling events
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>100, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],5))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>100, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+suppressWarnings({subsetstormsample(owcBR_GF)})
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+
+# lets plot everything out together: 
+ggplot() +
+  geom_boxplot(data = bigdfmstormsub_combined, aes(x=year, y=P_thous), fill = 'darkgrey') + # monthly + storm sampling
+  geom_boxplot(data = bigdfm_combined, aes(x=year, y=P_thous), fill = 'goldenrod') + # monthly sampling
+  geom_point(data = trueloading, aes (x=year, y=P_thous_true),color='mediumorchid') # daily sampling
+
+```
+
+So we see that if we only sample 5 of the biggest storms this method is definitely an improvement on monthly sampling! But depending on the year can still miss some amount of retention!
+
+
+<br>
+Let's take out time and calculate some metrics of this model including the bias, the imprecision, and the relative root mean square error!
+
+```{r}
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+print(dfmse)
+mean(dfmse$med)
+
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+print(Imprecisionmdfs) # values below 20% are acceptable. This indicates that there's high variation in uncertainty of our estimation.
+mean(Imprecisionmdfs$imprecision) # the average 
+
+# now to add these to our running dataframe of methodstats: 
+stormsubstats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M100_5")
+stormsubstats = stormsubstats[,c("year","med","imprecision","method")] # get rid of the excess columns
+
+methodstats = rbind(methodstats,stormsubstats) # add on to our running dataframe
+```
+
+<a name="variations"></a>
+
+### Variations on sampling regime
+
+TIME to test a whole bunch of variations in how we're measuring retention! 
+
+We have already done: 
+Weekly <br>
+Monthly <br>
+Monthly Outflow <br>
+Monthly with ALL storm events > 100 cfs <br>
+Monthly with 5 storm events > 100 cfs <br>
+
+
+Things to add: 
+Subset 1-4: 1-4 storm events sampled
+Subset 5-9: 1-5 storm events sampled @ 25 cfs 
+
+
+```{r}
+#################################
+# 1 storm event
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>100, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],1))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>100, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub1=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm1stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M100_1")
+storm1stats = storm1stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm1stats) # add on to our running dataframe
+#################################
+# 2 storm events
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>100, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],2))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>100, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm2stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M100_2")
+storm2stats = storm2stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm2stats) # add on to our running dataframe
+#################################
+# 3 storm events
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>100, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],3))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>100, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm3stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M100_3")
+storm3stats = storm3stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm3stats) # add on to our running dataframe
+#################################
+# 4 storm events
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>100, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],4))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>100, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm4stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M100_4")
+storm4stats = storm4stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm4stats) # add on to our running dataframe
+#################################
+# 10 storm events
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>100, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],10))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>100, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm10stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M100_10")
+storm10stats = storm10stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm10stats) # add on to our running dataframe
+#################################
+# 1 storm event 25 cfs
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>25, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],1))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>25, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm1stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M25_1")
+storm1stats = storm1stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm1stats) # add on to our running dataframe
+#################################
+# 2 storm events 25 cfs
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>25, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],2))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>25, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm2stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M25_2")
+storm2stats = storm2stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm2stats) # add on to our running dataframe
+#################################
+# 3 storm events 25 cfs
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>25, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],3))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>25, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm3stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M25_3")
+storm3stats = storm3stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm3stats) # add on to our running dataframe
+#################################
+# 4 storm events  25 cfs
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>25, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],4))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>25, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm4stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M25_4")
+storm4stats = storm4stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm4stats) # add on to our running dataframe
+#################################
+# 5 storm events  25 cfs
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>25, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],4))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>25, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm5stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M25_5")
+storm5stats = storm5stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm5stats) # add on to our running dataframe
+#################################
+# 10 storm events  25 cfs
+subsetstormsample<-function (data){
+  # convert to monthly sampling
+  working<-owcBR_GF #create dummy data set to operate on
+  working <- owcBR_GF %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working <- working %>%
+    mutate(stormcon = ifelse(discharge_cfs>25, TPmgL, 'NA'))
+  working$stormcon = as.numeric(working$stormcon)
+  working <- working %>%
+    group_by(year)%>%
+    mutate(stormPav = mean(sample(working$stormcon[complete.cases(working$stormcon)],10))) # sample 5 storms and use them to compute an average stormflow concentration for the year
+  working <- working %>%
+    group_by(month,year)%>%
+    mutate(stormPcon = ifelse(discharge_cfs>25, stormPav, TP_month)) # replace all storm values with the average storm concentration for the year  
+  working$P_lbs_storm = working$discharge_L * working$stormPcon / 453600 # calculate P load and convert to lbs 
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_storm,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfmstormsub=suppressWarnings({ replicate(1000, subsetstormsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfmstormsub_combined <- map_dfr(bigdfmstormsub, bind_rows, .id = "tib")                                  
+bigdfmstormsub_combined$year = as.factor(bigdfmstormsub_combined$year)
+bigdfmstormsub_combined$P_thous = bigdfmstormsub_combined$sum_P / 1000
+
+bigdfmstormsub_combined = bigdfmstormsub_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfmstormsub_combined$e = (bigdfmstormsub_combined$P_thous - bigdfmstormsub_combined$P_thous_true)/ bigdfmstormsub_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfmstormsub_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+storm10stats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "M25_10")
+storm10stats = storm10stats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,storm10stats) # add on to our running dataframe
+```
+
+DO NOT PUT THIS SECTION FURTHER DOWN. When you add things to the owcBR_GF dataframe you screw up the code so it doesn't work anymore. 
+
+<a name="loadout"></a>
+
+## Lets try out some of the weird methods of gap filling! Flow-weighted means, and linear interpolation
+
+Flow weighted means are generally calculated to get an accurate mean concentration for a highly variable wetland. It does that by weighting the values by the total water going through. It's not that useful (as you can see in the results) for calculating loading, because loading already accounts for flow. <br>
+
+So what we're doing here is taking monthly concentrations, and calculating the annual flow-weighted mean concentration. But it doesn't improve the scale of our monthly data and get at storm events because it's still just using the same 12 data points to calculate load. 
+
+```{r}
+
+# new function calculating loading with flow-weighted mean concentrations
+monthfwsample<-function (data){
+  # convert to monthly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month = TPmgL[daynum == random_day]) %>%  # create a value for monthly TP which is the TP value for our randomly selected day
+    select(-random_day)%>% # delete our randomly selected day so a new one is chosen for each month
+    mutate(monthflow = sum(discharge_L))
+  workmonth = working %>%
+    group_by(year,month)%>%
+    summarize_at(c("monthflow","TP_month"),mean)
+  workmonth = workmonth%>%
+    group_by(year)%>%
+    mutate(cumflow = sum(monthflow))%>%
+    mutate(perflow = monthflow / cumflow)%>%
+    mutate(fw = perflow * TP_month)%>%
+    mutate(fwmc = sum(fw))
+  
+  workmonth$P_lbs_fw = workmonth$fwmc * workmonth$monthflow / 453600 # calculate P load and convert to lbs 
+  workmonth %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_fw,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdffw=suppressWarnings({ replicate(1000, monthfwsample(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdffw_combined <- map_dfr(bigdffw, bind_rows, .id = "tib")                                  
+bigdffw_combined$year = as.factor(bigdffw_combined$year)
+bigdffw_combined$P_thous = bigdffw_combined$sum_P / 1000
+
+bigdffw_combined = bigdffw_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdffw_combined$e = (bigdffw_combined$P_thous - bigdffw_combined$P_thous_true)/ bigdffw_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdffw_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdffw_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdffw_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+fwmstats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "flow-weighted")
+fwmstats = fwmstats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,fwmstats) # add on to our running dataframe
+
+```
+
+Linear interpolation:
+1. Use linear interpolation function in R
+
+```{r}
+
+monthsampleint<-function (data){
+  # convert to monthly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TP_month_gap = ifelse(daynum == random_day, yes = TPmgL, no = "NA" )) %>% # select a random day to add to the data frame
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each month
+  working$TP_month <- approx(working$TP_month_gap, xout=seq_along(working$Date))$y # the $y just means that we don't want the date info back. But this interpolates for us.
+  working$P_lbs_week = working$discharge_L * working$TP_month / 453600 # calculate P load and convert to lbs 
+  working %>% # take our data set
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(P_lbs_week,na.rm = T)) # calculate the annual retention for each year in the data frame
+}
+
+monthsampleint(owcBR_GF) # here's an example of a single iteration of monthly sampling
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfint=suppressWarnings({ replicate(1000, monthsampleint(owcBR_GF),simplify=FALSE)}) # supress warnings is because at one point there are some NAs it gets mad about
+# combine all our dataframes together
+bigdfint_combined <- map_dfr(bigdfint, bind_rows, .id = "tib")                                  
+bigdfint_combined$year = as.factor(bigdfint_combined$year)
+bigdfint_combined$P_thous = bigdfint_combined$sum_P / 1000
+
+bigdfint_combined = bigdfint_combined %>% left_join(y=trueloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigdfint_combined$e = (bigdfint_combined$P_thous - bigdfint_combined$P_thous_true)/ bigdfint_combined$P_thous_true # calculate the error associated with each budget
+
+dfmse = bigdfint_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfint_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfint_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+# now to add these to our running dataframe of methodstats: 
+intstats <- dfmse %>% 
+  left_join(y=Imprecisionmdfs, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "lin interp")
+intstats = intstats[,c("year","med","imprecision","method")] # get rid of the excess columns
+methodstats = rbind(methodstats,intstats) # add on to our running dataframe
+```
+
+<a name="loadout"></a>
+
+## Lets try calculating the load leaving the wetland!
+
+
+We're going to reload the data because we want the outflow concentrations the tricky bit is figuring out what to do with measurements of discharge... the measurements taken are not consistent. We're going to start out by assuming that discharge in = discharge out. To be clear: this is not true, especially at OWC where the lake can backflow into the wetland! They have good flow measurements but only after the period where they have consistent outflow concentrations (they changed to weekly after deciding that daily sampling was not necessary at the outlet). So first lets try and replicate why they decided that daily flow was no longer necessary at the outlets!
+
+```{r}
+setwd("C:/Users/kande120/OneDrive - Kent State University/Phosphorus Budgets/OWC/Data")
+owcmasterdata<-read.csv("Master_Nutirent_Dataset_3-7-24.csv")
+owcmasterdata$Date<-mdy(owcmasterdata$Date) # tell R that the date is a date 
+
+# now lets subset the hell out of this dataset:
+owcRL <- subset(owcmasterdata, Project == "RL") # only the retention and load project 
+owcRLoutflow <- subset(owcRL, Site == "WM") # only the outflow at the wetland mouth
+owcRLoutflowrecent <- subset(owcRLoutflow, Date >= "2015-01-01" & Date < "2019-01-01") # only from 2015 on
+owcoDF = owcRLoutflowrecent %>% group_by(Site, Date = as.Date(Date,"%m/%d/%Y")) %>% summarise(across(c(TP), mean)) # average any daily TP replicates together 
+
+
+library(dataRetrieval)
+# Old Woman Creek at Berlin Rd near Huron OH
+siteNumber <- "04199155"
+owcInfo <- readNWISsite(siteNumber)
+parameterCd <- "00060"
+
+# As a note they have sub-daily data, but we don't need it. We're going to be pairing with daily nutrient data so it's actually super convenient that this code makes the data daily for us!
+# Raw daily data: 
+rawDailyData <- readNWISdv(
+  siteNumber, parameterCd,
+  "2015-05-05", "2024-01-01")
+colnames(rawDailyData)[colnames(rawDailyData) == 'X_00060_00003'] <- 'discharge_cfs'  #rename the discharge column to something meaningful
+
+owcoDF <- owcoDF %>% 
+  left_join(y=rawDailyData, by=c("Date")) # merge out 2 datasets
+
+owcoBR = owcoDF[c("Date","TP","discharge_cfs")] # clean up our dataset so it's just our 3 variables we're interested in
+owcoBR$discharge_L = owcoBR$discharge_cfs * 86400 * 28.3168 # Convert cubic feet/second to liters/day
+owcoBR$TPmgL = owcoBR$TP / 1000 # convert ug/L to mg/L
+owcoBR$P_lbs = owcoBR$discharge_L * owcoBR$TPmgL / 453600 # calculate P load and convert to lbs 
+
+
+# we're going to gap fill. It'll make everything easier in terms of coding this out
+# first we need to fill in all missing dates with NAs so r doesn't get mad at us:
+owcoBRcomplete = owcoBR %>% 
+  complete(Date = seq.Date(as.Date("2015-05-04"), max(Date), by = "1 day"))
+
+# Now we need to define the weeks and years in our dataset so r can pick them out
+owcoBRcomplete$day <- weekdays(owcoBRcomplete$Date) # Take out the day of the week
+owcoBRcomplete$week<-isoweek(owcoBRcomplete$Date) # Take out the number for each isoweek.
+owcoBRcomplete$year<-isoyear(owcoBRcomplete$Date) # Create a variable for each isoyear
+
+# then we fill all the gaps with the median value (we're going to use the median for the ENTIRE DATASET)
+owcoBR_GF = owcoBRcomplete %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+```
+
+
+```{r}
+# Now we can calculate the annual retention for each year:
+trueoloading = owcoBR_GF %>% 
+  group_by(year = lubridate::year(Date)) %>%
+  summarize(sum_P = sum(P_lbs,na.rm = T))
+print(trueoloading)
+
+# now we trasmute it into weekly sampling
+bigodf=replicate(1000, weeksample(owcoBR_GF),simplify=FALSE)
+# combine all our dataframes together
+bigodf_combined <- map_dfr(bigodf, bind_rows, .id = "tib")                                  
+bigodf_combined$year = as.factor(bigodf_combined$year)
+trueoloading$year = as.factor(trueoloading$year)
+bigodf_combined$P_thous = bigodf_combined$sum_P / 1000
+trueoloading$P_thous_true = trueoloading$sum_P / 1000
+
+# calculate weekly maximums
+maxovalues = maxsample(owcoBR_GF) # run the code
+maxovalues$year= as.factor(maxovalues$year)
+
+# first need to pick up the individual months:
+owcoBR_GF$month<-month(owcoBRcomplete$Date) # Create a variable for each month
+owcoBR_GF$daynum<-day(owcoBRcomplete$Date) # Create a variable for each day of the month
+owcoBR_GF$year<-year(owcoBRcomplete$Date) # Create a variable for each year (but this time NOT iso year because that makes everything all screwy)
+
+# trasmute to monthly sampling
+bigodfm=replicate(1000, monthsample(owcoBR_GF),simplify=FALSE)
+# combine all our dataframes together
+bigodfm_combined <- map_dfr(bigodfm, bind_rows, .id = "tib")                                  
+bigodfm_combined$year = as.factor(bigodfm_combined$year)
+trueoloading$year = as.factor(trueoloading$year)
+bigodfm_combined$P_thous = bigodfm_combined$sum_P / 1000
+trueoloading$P_thous_true = trueoloading$sum_P / 1000
+maxovalues$P_thous = maxovalues$sum_P / 1000
+
+# calculate monthly maximums
+maxovaluesm = maxsamplem(owcoBR_GF)
+maxovaluesm$P_thous = maxovaluesm$sum_P / 1000
+maxovaluesm$year = as.factor(maxovaluesm$year)
+
+# lets plot everything out together: 
+ggplot() +
+  geom_boxplot(data = bigodf_combined, aes(x=year, y=P_thous), fill = 'darkcyan') + # weekly sampling
+  geom_boxplot(data = bigodfm_combined, aes(x=year, y=P_thous), fill = 'goldenrod') + # monthly sampling
+  geom_point(data = trueoloading, aes (x=year, y=P_thous_true),color='mediumorchid')+ # daily sampling
+  geom_point(data = maxovalues, aes (x=year, y=P_thous),color='blue')+ # maximum values for taking the max number each WEEK
+  geom_point(data = maxovaluesm, aes (x=year, y=P_thous),color='red') # maximum values for taking the max number each MONTH
+```
+
+We see that the outlet again is underestimated compared to weekly sampling, but much less so than the inlet is! There's also a lot less variability in the range of possible values when changing sampling regime. Interesting finding there.
+
+The difference between estimated loading at the inlet vs. outlet could lead to inaccurate retention estimates! If the underestimation is low enough you could even estimate that a wetland is releasing phosphorus when it was in fact retaining it! 
+
+<br>
+Let's take out time and calculate some metrics of this model including the bias, the imprecision, and the relative root mean square error!
+
+```{r}
+### Weekly outflows
+bigodf_combined = bigodf_combined %>% left_join(y=trueoloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigodf_combined$e = (bigodf_combined$P_thous - bigodf_combined$P_thous_true)/ bigodf_combined$P_thous_true # calculate the error associated with each budget
+
+dfoe = bigodf_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+print(dfoe)
+mean(dfoe$med,na.rm=TRUE)
+
+dfo90 = bigodf_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfo10 = bigodf_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionodf = dfo90 %>% left_join(y=dfo10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionodf$imprecision = Imprecisionodf$value90-Imprecisionodf$value10
+print(Imprecisionodf) # values below 20% are acceptable. This indicates that there's high variation in uncertainty of our estimation.
+mean(Imprecisionodf$imprecision,na.rm=TRUE) # the average 
+
+# now to add these to our running dataframe of methodstats: 
+outweekstats <- dfoe %>% 
+  left_join(y=Imprecisionodf, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "week out")
+outweekstats = outweekstats[,c("year","med","imprecision","method")] # get rid of the excess columns
+outweekstats = subset(outweekstats, year != "2019") # get rid of 2019 because it has no data
+
+methodstats = rbind(methodstats,outweekstats) # add on to our running dataframe
+
+
+
+### Monthly outflows
+bigodfm_combined = bigodfm_combined %>% left_join(y=trueoloading, by=c("year")) # add the true values to the dataset so we can compute uncertainty!
+bigodfm_combined$e = (bigodfm_combined$P_thous - bigodfm_combined$P_thous_true)/ bigodfm_combined$P_thous_true # calculate the error associated with each budget
+
+dfome = bigodfm_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+print(dfome)
+mean(dfome$med)
+
+dfmo90 = bigodfm_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfmo10 = bigodfm_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmodf = dfmo90 %>% left_join(y=dfmo10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmodf$imprecision = Imprecisionmodf$value90-Imprecisionmodf$value10
+print(Imprecisionmodf) # values below 20% are acceptable. This indicates that there's high variation in uncertainty of our estimation.
+mean(Imprecisionmodf$imprecision) # the average 
+
+# now to add these to our running dataframe of methodstats: 
+outmonthstats <- dfome %>% 
+  left_join(y=Imprecisionmodf, by=c("year"))%>% # merge the bias and imprecision data
+  mutate(method = "monthly out")
+outmonthstats = outmonthstats[,c("year","med","imprecision","method")] # get rid of the excess columns
+
+methodstats = rbind(methodstats,outmonthstats) # add on to our running dataframe
+
+```
+
+<a name="retention1"></a>
+
+## Now lets try to combine these! Now we can actually measure retention!
+
+We're again going to assume that the discharge in = discharge out. We're specifically focused on phosphorus sampling and how variation in phosphorus can affect estimates of retention so FOR NOW we're going to let the discharge be inaccurate leaving the wetland. 
+
+```{r}
+setwd("C:/Users/kande120/OneDrive - Kent State University/Phosphorus Budgets/OWC/Data")
+owcmasterdata<-read.csv("Master_Nutirent_Dataset_3-7-24.csv")
+owcmasterdata$Date<-mdy(owcmasterdata$Date) # tell R that the date is a date 
+
+# now lets subset the hell out of this dataset:
+owcRL <- subset(owcmasterdata, Project == "RL") # only the retention and load project 
+
+owcRLrecent <- subset(owcRL, Date >= "2015-01-01" & Date < "2019-01-01") # only from 2015 to 2019 when they stopped measuring daily
+owcDF = owcRLrecent %>% group_by(Site, Date = as.Date(Date,"%m/%d/%Y")) %>% summarise(across(c(TP), mean)) # average any daily TP replicates together 
+owcDFnew = owcDF %>% 
+    pivot_wider(names_from = Site, values_from = TP)
+owcDFnew = owcDFnew %>% 
+  rename(TPin = BR,TPout = WM)
+
+library(dataRetrieval)
+# Old Woman Creek at Berlin Rd near Huron OH
+siteNumber <- "04199155"
+owcInfo <- readNWISsite(siteNumber)
+parameterCd <- "00060"
+
+# As a note they have sub-daily data, but we don't need it. We're going to be pairing with daily nutrient data so it's actually super convenient that this code makes the data daily for us!
+# Raw daily data: 
+rawDailyData <- readNWISdv(
+  siteNumber, parameterCd,
+  "2015-05-05", "2024-01-01")
+colnames(rawDailyData)[colnames(rawDailyData) == 'X_00060_00003'] <- 'discharge_cfs'  #rename the discharge column to something meaningful
+
+owcDFfull <- owcDFnew %>% 
+  left_join(y=rawDailyData, by=c("Date")) # merge out 2 datasets
+
+owcBRfull = owcDFfull[c("Date","TPin","TPout","discharge_cfs")] # clean up our dataset so it's just our 3 variables we're interested in
+owcBRfull$discharge_L = owcBRfull$discharge_cfs * 86400 * 28.3168 # Convert cubic feet/second to liters/day
+owcBRfull$TPinmgL = owcBRfull$TPin / 1000 # convert ug/L to mg/L
+owcBRfull$TPoutmgL = owcBRfull$TPout / 1000 # convert ug/L to mg/L
+owcBRfull$P_lbsin = owcBRfull$discharge_L * owcBRfull$TPinmgL / 453600 # calculate P load and convert to lbs 
+owcBRfull$P_lbsout = owcBRfull$discharge_L * owcBRfull$TPoutmgL / 453600 # calculate P load and convert to lbs 
+
+# we're going to gap fill. It'll make everything easier in terms of coding this out
+# first we need to fill in all missing dates with NAs so r doesn't get mad at us:
+owcBRfullcomplete = owcBRfull %>% 
+  complete(Date = seq.Date(as.Date("2015-05-04"), max(Date), by = "1 day"))
+
+# Now we need to define the weeks and years in our dataset so r can pick them out
+owcBRfullcomplete$day <- weekdays(owcBRfullcomplete$Date) # Take out the day of the week
+owcBRfullcomplete$week<-isoweek(owcBRfullcomplete$Date) # Take out the number for each isoweek.
+owcBRfullcomplete$year<-isoyear(owcBRfullcomplete$Date) # Create a variable for each isoyear
+
+# then we fill all the gaps with the median value (we're going to use the median for the ENTIRE DATASET)
+owcBRfull_GF = owcBRfullcomplete %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+
+# Now we can calculate the annual retention for each year:
+trueretention = owcBRfull_GF %>% 
+  group_by(year = lubridate::year(Date)) %>%
+  summarize(sum_P = sum((P_lbsin-P_lbsout),na.rm = T))
+print(trueretention)
+```
+
+Now we need to remake our algorithms so they calculate retention instead of loading.
+
+```{r}
+# first we make a function to translate our dataset from daily to weekly sampling with a random selection of days being chosen! Then calculate the annual retention for each year within the dataset
+weekretensample<-function (data){
+  # convert to weekly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(week,year) %>% # group by both week and year so this works across different weeks and across different years
+    mutate(random_day = sample(day,1)) %>% # sample 1 random day out of the week
+    mutate(TPin_week = TPinmgL[day == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    mutate(TPout_week = TPoutmgL[day == random_day]) %>%  # create a value for weekly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each week
+  working$P_lbsin_week = working$discharge_L * working$TPin_week / 453600 # calculate P load and convert to lbs 
+  working$P_lbsout_week = working$discharge_L * working$TPout_week / 453600 # calculate P load and convert to lbs
+  working$Preten_week = (working$P_lbsin_week - working$P_lbsout_week)
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(Preten_week,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+weekretensample(owcBRfull_GF) # here's an example of a single iteration of weekly sampling
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfr=replicate(1000, weekretensample(owcBRfull_GF),simplify=FALSE)
+# combine all our dataframes together
+bigdfr_combined <- map_dfr(bigdfr, bind_rows, .id = "tib")                                  
+bigdfr_combined$year = as.factor(bigdfr_combined$year)
+trueretention$year = as.factor(trueretention$year)
+bigdfr_combined$P_thous = bigdfr_combined$sum_P / 1000
+trueretention$P_thous_true = trueretention$sum_P / 1000
+# lets plot it out: 
+ggplot() +
+  geom_boxplot(data = bigdfr_combined, aes(x=year, y=P_thous)) + 
+  geom_point(data = trueretention, aes (x=year, y=P_thous_true),color='red')
+
+```
+
+So we see that when we're missing good outlet flow values, AND we have weekly sampling our underestimation of retention leads to on average NEGATIVE retention values due to the mismatch in accuracy when it comes to estimating load in vs. load out. 
+
+<br>
+Let's highlight this using our Bias and Imprecision values for each method at the inflow vs. outflow. 
+
+```{r}
+method <- c('Weekly','Weekly','Monthly','Monthly')
+site <- c('Inflow','Outflow','Inflow','Outflow')
+bias <- c(-0.405314, -0.1785602, -0.5644752, -0.3110493)
+imprecission <- c(0.3728673, 0.2560827, 0.4588433, 0.4045302)
+metrics = data.frame(method,site,bias,imprecission)
+# plot it out
+pbias <- ggplot(data=metrics, aes(x=method, y=bias, fill=site)) +xlab("")+
+geom_bar(stat="identity", color="black", position=position_dodge())+
+  theme_classic()
+pimprec <- ggplot(data=metrics, aes(x=method, y=imprecission, fill=site)) +
+geom_bar(stat="identity", color="black", position=position_dodge())+xlab("")+
+  theme_classic()
+ggarrange(pbias,pimprec)
+```
+
+
+<a name="realdischarge"></a>
+
+### Adding real discharge data
+
+
+So lets see how this changes with REAL outflow data (weekly baseflow concentrations and daily for all storm events >25 cfs)
+
+```{r}
+setwd("C:/Users/kande120/OneDrive - Kent State University/Phosphorus Budgets/OWC/Data")
+owcoutflow<-read.csv("WM Water Level and Flow Master Dataset_03-01-2024.csv")
+owcoutflow$Date<-mdy(owcoutflow$Date) # tell R that the date is a date 
+
+ggplot(owcoutflow, aes(x=FlowRate_cms, y=Corrected.Stage_meters)) +
+  geom_point() + 
+  xlab("Flow Rate (cm/sec)") + ylab("Stage (m)")+
+  stat_cor(method = "pearson",aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")))+ geom_smooth(method=lm, se=FALSE, fullrange=F) 
+
+# calculate the daily flow rate:
+owcout = owcoutflow %>% group_by(Date = as.Date(Date,"%m/%d/%Y")) %>% summarise(across(c(FlowRate_cms), mean)) # sum all daily discharge together 
+owcout <- subset(owcout, Date >= "2022-01-01") # only from 2023
+
+ggplot(owcout, aes(x=Date, y=FlowRate_cms)) +
+  geom_line() + 
+  xlab("") + ylab("Flow Rate (cms)")+theme_classic()
+```
+There's not a clear relationship between flow rate and stage. 
+<br>
+
+So lets build out the weekly + storm sampling to extend the baseflow and see how our bias looks in a couple different configurations of the data!  
+
+
+```{r}
+# resubset the nutrient dataset:
+owcRL23 <- subset(owcRL, Date >= "2023-01-01" & Date < "2024-01-01") # only from 2023
+
+owcDF23 = owcRL23 %>% group_by(Site, Date = as.Date(Date,"%m/%d/%Y")) %>% summarise(across(c(TP), mean)) # average any daily TP replicates together 
+owcDF23new = owcDF23 %>% 
+    pivot_wider(names_from = Site, values_from = TP)
+owcDF23new = owcDF23new %>% 
+  rename(TPin = BR,TPout = WM)
+
+owcDF23full <- owcDF23new %>% 
+  left_join(y=owcout, by=c("Date")) # merge out 2 datasets
+
+owcDF23full$outflow_Ls = owcDF23full$FlowRate_cms*1000
+owcDF23full$outflow_L = owcDF23full$outflow_Ls*86400 
+owcDF23full$P_lbsout = (owcDF23full$outflow_L*(owcDF23full$TPout/1000)) / 453600 # convert ug/L to mg/L and convert to lbs
+
+owcDF23full$month<-month(owcDF23full$Date) # Create a variable for each month
+
+
+# gap fill with the median for TP and discharge
+owcDF23final = owcDF23full %>% 
+  group_by(month) %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+
+
+# Now we can calculate the annual retention for each year:
+outloading = owcDF23final %>% 
+  group_by(month = lubridate::month(Date)) %>%
+  summarize(sum_P = sum(P_lbsout,na.rm = T))
+print(outloading)
+Pin23 = 11539
+Pout23 = sum(outloading$sum_P)
+reten23 = Pin23 - Pout23
+print(reten23)
+```
+
+
+What we see is that the outlet of the wetland has higher concentrations of P, but less variability in concentration. 
+
+<br>
+
+Now we can calculate and look at the bias at the outlet for 2023: 
+```{r}
+# first we need to make a dataframe with inflow concentrations, outflow concentrations, inflowing water, and outflowing water
+discharge23 = subset(owcBR_GF, year == "2023")
+dis23 = data.frame(discharge23$discharge_L, discharge23$Date)
+colnames(dis23) = c("inflow_L","Date") # chance the column names
+# merge together
+owc23 <- owcDF23final %>% 
+  left_join(y=dis23, by=c("Date")) # merge our 2 datasets
+owc23$TPinmgL = owc23$TPin / 1000
+owc23$TPoutmgL = owc23$TPout / 1000
+owc23$year = as.factor("2023")
+owc23$month = as.factor(owc23$month)
+owc23$daynum<-day(owc23$Date) # Create a variable for each day of the month
+
+
+# make our algorithm
+monthretensample<-function (data){
+  # convert to weekly sampling
+  working<-data #create dummy data set to operate on
+  working <- data %>% 
+    group_by(month,year) %>% # group by both month and year so this works across different months and across different years
+    mutate(random_day = sample(daynum,1)) %>% # sample 1 random day out of the month
+    mutate(TPin_month = TPinmgL[daynum == random_day]) %>%  # create a value for monthly TP which is the TP value for our randomly selected day
+    mutate(TPout_month = TPoutmgL[daynum == random_day]) %>%  # create a value for monthly TP which is the TP value for our randomly selected day
+    select(-random_day) # delete our randomly selected day so a new one is chosen for each week
+  working$P_lbsin_month = working$inflow_L * working$TPin_month / 453600 # calculate P load and convert to lbs 
+  working$P_lbsout_month = working$outflow_L * working$TPout_month / 453600 # calculate P load and convert to lbs
+  working$Preten_month = (working$P_lbsin_month - working$P_lbsout_month)
+  working %>% # take our dataset
+    group_by(year) %>% # group so we get a value for each year
+    summarize(sum_P = sum(Preten_month,na.rm = T)) # calculate the annual retention for each year in the dataframe
+}
+
+
+# Now we replicate this function a couple thousand times, and add all the results to a dataframe.
+bigdfr23=replicate(1000, monthretensample(owc23),simplify=FALSE)
+# combine all our dataframes together
+bigdfr_combined23 <- map_dfr(bigdfr23, bind_rows, .id = "tib")                                  
+bigdfr_combined23$year = as.factor(bigdfr_combined23$year)
+bigdfr_combined23$P_thous = bigdfr_combined23$sum_P / 1000
+
+bigdfr_combined1 = bind_rows(bigdfr_combined, bigdfr_combined23)
+bigdfr_combined1 = subset(bigdfr_combined1, year != "2019")
+# lets plot it out: 
+ggplot() +
+  geom_boxplot(data = bigdfr_combined1, aes(x=year, y=sum_P)) + 
+  geom_point(aes (x="2023", y=5454.174),color='red')+ 
+  geom_point(data = trueretention, aes (x=year, y=sum_P),color='red')+theme_classic()
+```
+CLEARLY ILLUSTRATES THE PROBLEM!! This time with REAL DATA!! 
+<br> 
+Let's calculate biases just to be safe: 
+
+```{r}
+bigdfr_combined$true_reten = 5454.174
+bigdfr_combined$e = (bigdfr_combined$sum_P - bigdfr_combined$true_reten)/ bigdfr_combined$true_reten # calculate the error associated with each budget
+
+
+dfmse = bigdfr_combined %>% 
+  group_by(year) %>% 
+  summarise(med = median(e)) # this is a measure of the Bias. Negative number indicates a consistent negative bias (here it ranges between years from -10 to -60%)
+dfms90 = bigdfr_combined %>% 
+  group_by(year) %>% 
+  summarise("value90" = quantile(e, probs=0.9, na.rm=TRUE)) # calculate the 90th percentile for each year
+dfms10 = bigdfr_combined %>% 
+  group_by(year) %>% 
+  summarise("value10" = quantile(e, probs=0.1, na.rm=TRUE)) # calculate the 10th percentile for each year
+Imprecisionmdfs = dfms90 %>% left_join(y=dfms10, by=c("year")) # Merge the 90th and 10th percentile
+Imprecisionmdfs$imprecision = Imprecisionmdfs$value90-Imprecisionmdfs$value10
+dfmse
+Imprecisionmdfs
+```
+
+<a name="methodcompare"></a>
+
+### Lets compare our various methods against each other to see how they do: 
+
+```{r}
+# Summarize our data
+grouped <- group_by(methodstats, method)
+dfbias=summarise(grouped, medi=mean(med), sd=sd(med))
+
+# plot bias 
+dfbias$method = factor(dfbias$method, ordered = TRUE, 
+                       levels = c("all_storms", "M100_1", "M100_2", "M100_3", "M100_4", "M100_5", "M100_10", "M25_1", "M25_2", "M25_3", "M25_4", "M25_5","M25_10", "weekly","monthly","monthly out","week out", "flow-weighted","lin interp"))
+pbias = ggplot(dfbias, aes(x=method, y=medi)) + 
+  geom_pointrange(aes(ymin=medi-sd, ymax=medi+sd))+ylab("Bias")+ theme(axis.text.x = element_text(angle=90))
+
+# now for imprecision
+grouped <- group_by(methodstats, method)
+dfimp =summarise(grouped, imp=mean(imprecision), sd=sd(imprecision))
+
+dfimp$method = factor(dfimp$method, ordered = TRUE, 
+                      levels = c("all_storms", "M100_1", "M100_2", "M100_3", "M100_4", "M100_5", "M100_10", "M25_1", "M25_2", "M25_3", "M25_4", "M25_5","M25_10", "weekly","monthly","monthly out","week out", "flow-weighted","lin interp"))
+# plot imprecision 
+pimp = ggplot(dfimp, aes(x=method, y=imp)) + 
+  geom_pointrange(aes(ymin=imp-sd, ymax=imp+sd))+ylab("Imprecision")+ theme(axis.text.x = element_text(angle=90))
+
+ggarrange(pbias, pimp)
+
+```
+
+Each year is used as a different replicate to calculate the standard deviation for this plot, whereas the error (and bias and imprecision) is calculated using the 1,000-10,000 replicate samples. 
+
+Here bias refers the the extent to which the estimates are different from the true values, whereas imprecision refers to the variability within estimates. Bias is the median error value for each year from the 1,000 - 10,000 replicates. Imprecision is the mean of the 90th percentile minus the 10th percentile of error for each replicate. 
+
+```{r}
+# lets make a less messy version of this graph: 
+
+# strip out some categories: 
+dfbiasstorm = subset(dfbias, method == "all_storms" | method ==  "M100_1"| method == "M100_2"| method == "M100_3"| method == "M100_4"| method == "M100_5"| method == "M100_10"| method == "M25_1"| method == "M25_2"| method == "M25_3"| method == "M25_4"| method == "M25_5"| method =="M25_10")
+
+dfbiasfigure = subset(dfbias, method == "monthly" | method == "monthly out" | method ==  "weekly" | method == "week out" | method == "all_storms" | method == "M100_5" | method == "M25_5" | method == "flow-weighted" | method == "lin interp")
+
+# plot bias figure
+dfbiasfigure$method = factor(dfbiasfigure$method, ordered = TRUE, 
+                       levels = c("weekly","week out","monthly","monthly out", "all_storms", "M100_1", "M100_2", "M100_3", "M100_4", "M100_5", "M100_10", "M25_1", "M25_2", "M25_3", "M25_4", "M25_5","M25_10", "flow-weighted","lin interp"))
+pbias = ggplot(dfbiasfigure, aes(x=method, y=medi)) + 
+  geom_pointrange(aes(ymin=medi-sd, ymax=medi+sd))+ylab("Bias")+
+  theme_classic()+ theme(axis.text.x = element_text(angle=90))
+
+# plot bias storm supplement figure
+dfbiasstorm$method = factor(dfbiasstorm$method, ordered = TRUE, 
+                       levels = c("weekly","week out","monthly","monthly out", "all_storms", "M100_1", "M100_2", "M100_3", "M100_4", "M100_5", "M100_10", "M25_1", "M25_2", "M25_3", "M25_4", "M25_5","M25_10", "flow-weighted","lin interp"))
+pbiasstorm = ggplot(dfbiasstorm, aes(x=method, y=medi)) + 
+  geom_pointrange(aes(ymin=medi-sd, ymax=medi+sd))+ylab("Bias")+
+  theme_classic()+ theme(axis.text.x = element_text(angle=90))
+
+
+# now for imprecision
+grouped <- group_by(methodstats, method)
+dfimp =summarise(grouped, imp=mean(imprecision), sd=sd(imprecision))
+
+dfimp$method = factor(dfimp$method, ordered = TRUE, 
+                      levels = c("weekly","week out","monthly","monthly out", "all_storms", "M100_1", "M100_2", "M100_3", "M100_4", "M100_5", "M100_10", "M25_1", "M25_2", "M25_3", "M25_4", "M25_5","M25_10", "flow-weighted","lin interp"))
+dfimpfigure = subset(dfimp, method == "monthly" | method == "monthly out" | method ==  "weekly" | method == "week out" | method == "all_storms" | method == "M100_5" | method == "M25_5" | method == "flow-weighted" | method == "lin interp")
+
+# strip out some categories: 
+dfimpstorm = subset(dfimp, method == "all_storms" | method ==  "M100_1"| method == "M100_2"| method == "M100_3"| method == "M100_4"| method == "M100_5"| method == "M100_10"| method == "M25_1"| method == "M25_2"| method == "M25_3"| method == "M25_4"| method == "M25_5"| method =="M25_10")
+
+
+# plot imprecision 
+pimp = ggplot(dfimpfigure, aes(x=method, y=imp)) + 
+  geom_pointrange(aes(ymin=imp-sd, ymax=imp+sd))+ylab("Imprecision")+
+  theme_classic()+ theme(axis.text.x = element_text(angle=90))
+
+pimpstorm = ggplot(dfimpstorm, aes(x=method, y=imp)) + 
+  geom_pointrange(aes(ymin=imp-sd, ymax=imp+sd))+ylab("Imprecision")+
+  theme_classic()+ theme(axis.text.x = element_text(angle=90))
+
+ggarrange(pbias, pimp)
+
+ggarrange(pbiasstorm,pimpstorm)
+
+```
+Lets do some stats with the various methods of calculating bias and imprecision:
+
+```{r}
+groupedfigure = subset(grouped, method == "monthly" | method == "monthly out" | method ==  "weekly" | method == "week out" | method == "all_storms" | method == "M100_5" | method == "M25_5" | method == "flow-weighted" | method == "lin interp")
+
+
+abias = aov(med~method, groupedfigure)
+summary(abias)
+TukeyHSD(abias)
+
+aimp = aov(imprecision~method, groupedfigure)
+summary(aimp)
+TukeyHSD(aimp)
+
+# Storms
+
+groupedstorm = subset(grouped, method == "all_storms" | method ==  "M100_1"| method == "M100_2"| method == "M100_3"| method == "M100_4"| method == "M100_5"| method == "M100_10"| method == "M25_1"| method == "M25_2"| method == "M25_3"| method == "M25_4"| method == "M25_5"| method =="M25_10")
+
+asbias = aov(med~method, groupedstorm)
+summary(asbias)
+TukeyHSD(asbias)
+
+asimp = aov(imprecision~method, groupedstorm)
+summary(asimp)
+TukeyHSD(asimp)
+
+```
